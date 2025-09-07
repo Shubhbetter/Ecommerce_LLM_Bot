@@ -1,47 +1,59 @@
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.prompts import PromptTemplate
-from langchain.chains.question_answering import load_qa_chain
-from langchain_community.llms import HuggingFacePipeline
-from langchain_community.document_loaders.csv_loader import CSVLoader
-from transformers import pipeline
+import google.generativeai as genai
+import pandas as pd
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import numpy as np
+import faiss
+import os
+api_key = "AIzaSyANdlRmC_bLlVXuAwTfCOfSwZNFYWy1ZGw"
+genai.configure(api_key=api_key)
 
-# Embeddings
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
 
-# Load fine-tuned model
-pipe = pipeline(
-    "text2text-generation",
-    model="./models/fine_tuned_model",
-    tokenizer="./models/fine_tuned_model",
-    max_length=512
-)
-llm = HuggingFacePipeline(pipeline=pipe)
+faq_data = pd.read_csv('Ecommerce_FAQs.csv', encoding='cp1252')
 
-# Create Vector DB
-def create_vectordb():
-    loader = CSVLoader(file_path="./data/faqs.csv")
-    docs = loader.load()
-    vectordb = FAISS.from_documents(docs, embeddings)
-    vectordb.save_local("./faiss_index")
+faq_data.columns = faq_data.columns.str.strip()
+questions = faq_data['prompt'].tolist()  
+answers = faq_data['response'].tolist() 
 
-# Get response from bot
+question_embeddings = embeddings.embed_documents(questions)
+
+print(question_embeddings[:5])
+
+embedding_dimension = len(question_embeddings[0])
+faiss_index = faiss.IndexFlatL2(embedding_dimension) 
+faiss_index.add(np.array(question_embeddings))
+
+faiss.write_index(faiss_index, './faiss_index.index')
+print("FAISS index created and saved.")
+
 def get_response(query):
-    vectordb = FAISS.load_local("./faiss_index", embeddings, allow_dangerous_deserialization=True)
-    retriever = vectordb.as_retriever()
+    if "hello" in query.lower() or "hi" in query.lower():
+        print("Hello, Good Day, welcome to shope.")
+    else:
+        if not os.path.exists('./faiss_index.index'):
+            raise FileNotFoundError("FAISS index file not found. Please run create_vectordb() first.")
 
-    prompt_template = """Given the following context and a question, generate an answer based only on this context.
-    If the answer is not found, reply with "I don't know."
+        faiss_index = faiss.read_index('./faiss_index.index')
+        query_embedding = embeddings.embed_query(query)
+        k = 5 
+        distances, indices = faiss_index.search(np.array([query_embedding]), k)
+        relevant_questions = [questions[i] for i in indices[0]]
+        relevant_answers = [answers[i] for i in indices[0]]
+        context = "\n".join([f"Q: {q}\nA: {a}" for q, a in zip(relevant_questions, relevant_answers)])
 
-    CONTEXT: {context}
-    QUESTION: {question}"""
+        prompt_template = """Given the following context and a question, generate an answer based on this context only.
+        In the answer, try to use as much text as possible from the source document context without making any changes.
+        If the answer is not found in the context, kindly state "I don't know." Don't try to fabricate an answer.
 
-    PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(llm, chain_type="stuff", prompt=PROMPT)
+        CONTEXT: {context}
 
-    response = chain.invoke(
-        {"input_documents": retriever.get_relevant_documents(query), "question": query},
-        return_only_outputs=True
-    )["output_text"]
+        QUESTION: {question}"""
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt_template.format(context=context, question=query))
 
-    return response
+        return response.text
+
+if __name__ == '__main__':
+    while True:
+        query = input("Enter a question: ")
+        print(get_response(query))
